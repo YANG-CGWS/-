@@ -1,0 +1,138 @@
+# 文件名：stock_scanner_app.py
+# 这是一个网页版选股工具，运行后会在浏览器中打开
+
+import streamlit as st
+import akshare as ak
+import pandas as pd
+from datetime import datetime, timedelta
+import time
+
+st.set_page_config(page_title="选股策略工具", layout="wide")
+st.title("📊 三层漏斗选股策略")
+st.markdown("**基本面排雷 → 资金验证 → 技术确认**")
+
+# 侧边栏：股票池管理
+st.sidebar.header("股票池设置")
+default_stocks = "600519,000858,300750,002475,600036,601138,000063,002371,300308"
+stock_input = st.sidebar.text_area("请输入股票代码（用逗号分隔）", default_stocks)
+stock_list = [s.strip() for s in stock_input.split(',') if s.strip()]
+
+# 参数调整
+st.sidebar.subheader("筛选参数")
+min_score = st.sidebar.slider("最低综合评分", 1, 3, 2, help="评分越高条件越严格")
+
+if st.sidebar.button("开始扫描"):
+    with st.spinner("正在扫描，请稍候..."):
+        results = []
+        progress_bar = st.progress(0)
+        
+        for idx, code in enumerate(stock_list):
+            progress_bar.progress((idx + 1) / len(stock_list))
+            try:
+                # 获取数据
+                end_date = datetime.now().strftime('%Y%m%d')
+                start_date = (datetime.now() - timedelta(days=120)).strftime('%Y%m%d')
+                df_price = ak.stock_zh_a_hist(symbol=code, period='daily', start_date=start_date, end_date=end_date)
+                if df_price.empty:
+                    continue
+                
+                # 财务数据（简化）
+                try:
+                    profit = ak.stock_profit_sheet_by_report_em(symbol=code, report_type='1')
+                    if not profit.empty:
+                        latest = profit.iloc[-1]
+                        revenue = latest.get('营业总收入', 0)
+                        net_profit = latest.get('净利润', 0)
+                        growth = (net_profit - profit.iloc[-2].get('净利润', 0)) / abs(profit.iloc[-2].get('净利润', 0)) if len(profit) >=2 else 0
+                    else:
+                        growth = 0
+                except:
+                    growth = 0
+                
+                # 资金流向
+                try:
+                    flow = ak.stock_individual_fund_flow(stock=code, market='')
+                    main_flow = flow['主力净流入'].iloc[:5].sum() if not flow.empty else 0
+                except:
+                    main_flow = 0
+                
+                # 技术指标
+                close = df_price['收盘']
+                ma20 = close.rolling(20).mean().iloc[-1]
+                current = close.iloc[-1]
+                above_ma20 = current > ma20
+                
+                # MACD
+                exp1 = close.ewm(span=12, adjust=False).mean()
+                exp2 = close.ewm(span=26, adjust=False).mean()
+                dif = exp1 - exp2
+                dea = dif.ewm(span=9, adjust=False).mean()
+                macd_golden = dif.iloc[-1] > dea.iloc[-1]
+                
+                # 成交量
+                vol = df_price['成交量']
+                vol_ma5 = vol.rolling(5).mean()
+                vol_condition = all(vol.iloc[-3:] > vol_ma5.iloc[-3:]) if len(vol) >=3 else False
+                
+                # 打分
+                score = 0
+                reasons = []
+                if growth > 0:
+                    score += 1
+                    reasons.append("业绩增长")
+                else:
+                    reasons.append("业绩下滑")
+                if main_flow > 0:
+                    score += 1
+                    reasons.append("主力净流入")
+                else:
+                    reasons.append("主力净流出")
+                if above_ma20 and macd_golden and vol_condition:
+                    score += 1
+                    reasons.append("技术共振")
+                else:
+                    reasons.append("技术偏弱")
+                
+                # 获取名称
+                try:
+                    name = df_price['股票名称'].iloc[0]
+                except:
+                    name = code
+                
+                results.append({
+                    '代码': code,
+                    '名称': name,
+                    '综合评分': score,
+                    '理由': ' | '.join(reasons),
+                    '当前价': round(current, 2),
+                    'MA20': round(ma20, 2),
+                    '主力净流入(万)': round(main_flow/10000, 2)
+                })
+                time.sleep(0.2)  # 避免请求过快
+            except Exception as e:
+                st.warning(f"扫描 {code} 失败: {e}")
+        
+        progress_bar.empty()
+        
+        if results:
+            df = pd.DataFrame(results)
+            df = df.sort_values('综合评分', ascending=False)
+            
+            # 过滤
+            df_filtered = df[df['综合评分'] >= min_score]
+            
+            st.subheader(f"📈 选股结果（共 {len(df_filtered)} 只，评分≥{min_score}）")
+            if not df_filtered.empty:
+                st.dataframe(df_filtered, use_container_width=True)
+                
+                # 突出显示高分股
+                top = df_filtered[df_filtered['综合评分'] == df_filtered['综合评分'].max()]
+                st.success(f"🏆 当前最优标的：{top.iloc[0]['名称']} ({top.iloc[0]['代码']})，评分 {top.iloc[0]['综合评分']}/3")
+            else:
+                st.info("当前条件下未筛选出符合条件的股票，建议降低评分门槛")
+        else:
+            st.error("未获取到任何数据，请检查股票代码或网络连接")
+
+st.sidebar.markdown("---")
+st.sidebar.caption("数据来源：AKShare 开源数据")
+st.sidebar.caption("⚠️ 结果仅供参考，不构成投资建议")
